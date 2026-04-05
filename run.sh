@@ -1,1 +1,2 @@
- conda run -n base python CV_depth_information.py --left left.png --right right.png --out_dir outputs_conda_base_test
+conda run -n base python CV_depth_information.py  \
+--left left.png --right right.png --out_dir outputs_conda_base_test

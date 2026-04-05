@@ -1,178 +1,162 @@
 import argparse
 import os
-from typing import List, Optional
-
 import cv2
 import numpy as np
 
 
-def edge_enhance(img_rgb: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    grad = cv2.magnitude(grad_x, grad_y)
-    maxv = float(grad.max())
-    if maxv <= 0:
-        grad_u8 = np.zeros_like(gray, dtype=np.uint8)
-    else:
-        grad_u8 = (grad / maxv * 255).astype(np.uint8)
-    return cv2.merge([gray, grad_u8, grad_u8])
+# =========================
+# 1. 多曝光 → 灰度 → 加权融合
+# =========================
+def fuse_exposure_to_gray(img_list):
+    grays = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) for img in img_list]
+    weights = np.ones(len(grays)) / len(grays)
+    fused = sum(w * g for w, g in zip(weights, grays))
+    return fused.astype(np.uint8)
 
 
-def compute_disparity_sgbm(left: np.ndarray, right: np.ndarray, num_disp: int, block_size: int) -> np.ndarray:
-    if num_disp % 16 != 0:
-        raise ValueError(f"num_disp must be multiple of 16, got {num_disp}")
-    if block_size % 2 == 0 or block_size < 3:
-        raise ValueError(f"block_size must be odd and >= 3, got {block_size}")
+# =========================
+# 2. 抽象 Agent（结构提取）
+# =========================
+def abstract_structure(gray):
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(grad_x, grad_y)
 
+    # 结构保留（强梯度）
+    _, structure = cv2.threshold(mag, 30, 255, cv2.THRESH_BINARY)
+    return structure.astype(np.uint8)
+
+
+# =========================
+# 3. 回写结构 → 原图
+# =========================
+def writeback_structure(original, structure, alpha=0.8, beta=0.2):
+    structure_3c = cv2.merge([structure, structure, structure])
+    out = cv2.addWeighted(original, alpha, structure_3c, beta, 0)
+    return out
+
+
+# =========================
+# 4. 边缘增强 Agent（轻量）
+# =========================
+def edge_enhance(img):
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    return cv2.filter2D(img, -1, kernel)
+
+
+# =========================
+# 5. 视差计算
+# =========================
+def compute_disparity(left, right):
     stereo = cv2.StereoSGBM_create(
         minDisparity=0,
-        numDisparities=num_disp,
-        blockSize=block_size,
-        P1=8 * 3 * block_size**2,
-        P2=32 * 3 * block_size**2,
-        uniquenessRatio=10,
-        speckleWindowSize=100,
-        speckleRange=32,
-        disp12MaxDiff=1,
+        numDisparities=64,
+        blockSize=7,
+        P1=8 * 3 * 7**2,
+        P2=32 * 3 * 7**2,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
-    return stereo.compute(left, right).astype(np.float32) / 16.0
+    disp = stereo.compute(left, right).astype(np.float32) / 16.0
+    return disp
 
 
-def depth_from_disparity(disparity: np.ndarray, focal_length_px: float, baseline_m: float) -> np.ndarray:
-    return (focal_length_px * baseline_m) / (disparity + 1e-6)
+# =========================
+# 6. 深度计算
+# =========================
+def depth_from_disp(disp, f=721.5377, B=0.5327254279298227):
+    return (f * B) / (disp + 1e-6)
 
 
-def normalize_to_u8(img: np.ndarray, lo: float = 2.0, hi: float = 98.0) -> np.ndarray:
-    finite = np.isfinite(img)
-    if not finite.any():
-        return np.zeros(img.shape, dtype=np.uint8)
-    v = img[finite]
-    vmin, vmax = np.percentile(v, [lo, hi])
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        return np.zeros(img.shape, dtype=np.uint8)
-    out = (img - vmin) / (vmax - vmin)
-    out = np.clip(out, 0.0, 1.0)
-    return (out * 255.0).astype(np.uint8)
+# =========================
+# 7. 拟合 Agent（重）
+# =========================
+def fit_depth(depth):
+    # 简单平滑 + 拟合（占位实现）
+    depth_blur = cv2.bilateralFilter(depth.astype(np.float32), 9, 75, 75)
+    return depth_blur
 
 
-def run_classifier(view_imgs_rgb: List[np.ndarray], num_classes: int) -> Optional[int]:
-    try:
-        import torch
-        import torch.nn as nn
-        import torchvision.models as models
-        import torchvision.transforms as T
-    except Exception as e:
-        print(f"Skip classifier (missing torch/torchvision): {e}")
-        return None
-
-    class MultiViewClassifier(nn.Module):
-        def __init__(self, num_views: int, num_classes: int):
-            super().__init__()
-            self.num_views = num_views
-            self.backbone = models.resnet18(weights=None)
-            self.backbone.fc = nn.Identity()
-            self.fc = nn.Linear(512, num_classes)
-
-        def forward(self, imgs: List[torch.Tensor]) -> torch.Tensor:
-            feats = [self.backbone(img) for img in imgs]
-            fused = torch.mean(torch.stack(feats), dim=0)
-            return self.fc(fused)
-
-    transform = T.Compose(
-        [
-            T.ToTensor(),
-            T.Resize((224, 224)),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    view_tensors = [transform(img).unsqueeze(0) for img in view_imgs_rgb]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiViewClassifier(num_views=len(view_tensors), num_classes=num_classes).to(device)
-    model.eval()
-
-    with torch.no_grad():
-        view_tensors = [t.to(device) for t in view_tensors]
-        logits = model(view_tensors)
-        pred = int(torch.argmax(logits, dim=1).item())
-    return pred
-
-
-def main() -> int:
+# =========================
+# 主流程（严格按你定义顺序）
+# =========================
+def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--imgs", nargs=5, help="5张曝光图")
     parser.add_argument("--left", default="left.png")
     parser.add_argument("--right", default="right.png")
     parser.add_argument("--out_dir", default="outputs")
-    parser.add_argument("--num_disp", type=int, default=64)
-    parser.add_argument("--block_size", type=int, default=7)
-    parser.add_argument("--focal_length_px", type=float, default=0.8)
-    parser.add_argument("--baseline_m", type=float, default=0.1)
-    parser.add_argument("--run_classifier", action="store_true")
-    parser.add_argument("--num_classes", type=int, default=5)
     args = parser.parse_args()
-
-    left_bgr = cv2.imread(args.left, cv2.IMREAD_COLOR)
-    right_bgr = cv2.imread(args.right, cv2.IMREAD_COLOR)
-    if left_bgr is None:
-        raise FileNotFoundError(f"Failed to read left image: {args.left}")
-    if right_bgr is None:
-        raise FileNotFoundError(f"Failed to read right image: {args.right}")
-    if left_bgr.shape[:2] != right_bgr.shape[:2]:
-        raise ValueError(f"left/right size mismatch: {left_bgr.shape} vs {right_bgr.shape}")
-
-    left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
-    right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
-
-    left_enh = edge_enhance(left_rgb)
-    right_enh = edge_enhance(right_rgb)
-
-    disp_map = compute_disparity_sgbm(left_enh, right_enh, num_disp=args.num_disp, block_size=args.block_size)
-    depth_map = depth_from_disparity(disp_map, focal_length_px=args.focal_length_px, baseline_m=args.baseline_m)
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    cv2.imwrite(os.path.join(args.out_dir, "left_enh.png"), cv2.cvtColor(left_enh, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(os.path.join(args.out_dir, "right_enh.png"), cv2.cvtColor(right_enh, cv2.COLOR_RGB2BGR))
+    if args.imgs is not None:
+        imgs = [cv2.imread(p) for p in args.imgs]
+        if any(img is None for img in imgs):
+            missing = [p for p, img in zip(args.imgs, imgs) if img is None]
+            raise FileNotFoundError(f"Failed to read: {missing}")
+        left_raw = None
+        right_raw = None
+    else:
+        left_raw = cv2.imread(args.left, cv2.IMREAD_COLOR)
+        right_raw = cv2.imread(args.right, cv2.IMREAD_COLOR)
+        if left_raw is None:
+            raise FileNotFoundError(f"Failed to read left image: {args.left}")
+        if right_raw is None:
+            raise FileNotFoundError(f"Failed to read right image: {args.right}")
+        if left_raw.shape[:2] != right_raw.shape[:2]:
+            raise ValueError(f"left/right size mismatch: {left_raw.shape} vs {right_raw.shape}")
+        imgs = [left_raw, left_raw, left_raw, left_raw, left_raw]
 
-    disp_u8 = normalize_to_u8(disp_map)
-    disp_color = cv2.applyColorMap(disp_u8, cv2.COLORMAP_INFERNO)
-    cv2.imwrite(os.path.join(args.out_dir, "disparity.png"), disp_color)
+    # 1张原图 + 4张做灰度融合
+    original = imgs[0]
+    fused_gray = fuse_exposure_to_gray(imgs[1:])
 
-    depth_u8 = normalize_to_u8(depth_map)
-    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_PLASMA)
-    cv2.imwrite(os.path.join(args.out_dir, "depth.png"), depth_color)
+    # 抽象 Agent
+    structure = abstract_structure(fused_gray)
 
-    disp_finite = np.isfinite(disp_map)
-    depth_finite = np.isfinite(depth_map)
-    print(
-        "disparity:",
-        "min",
-        float(np.min(disp_map[disp_finite])) if disp_finite.any() else None,
-        "max",
-        float(np.max(disp_map[disp_finite])) if disp_finite.any() else None,
-        "mean",
-        float(np.mean(disp_map[disp_finite])) if disp_finite.any() else None,
-    )
-    print(
-        "depth:",
-        "min",
-        float(np.min(depth_map[depth_finite])) if depth_finite.any() else None,
-        "max",
-        float(np.max(depth_map[depth_finite])) if depth_finite.any() else None,
-        "mean",
-        float(np.mean(depth_map[depth_finite])) if depth_finite.any() else None,
-    )
-    print("saved:", os.path.abspath(args.out_dir))
+    # 回写结构
+    enhanced = writeback_structure(original, structure)
 
-    if args.run_classifier:
-        pred = run_classifier([left_rgb, right_rgb], num_classes=args.num_classes)
-        if pred is not None:
-            print("Predicted object class:", pred)
+    # 边缘增强 Agent
+    edge_img = edge_enhance(enhanced)
 
-    return 0
+    if right_raw is None:
+        left = cv2.cvtColor(edge_img, cv2.COLOR_BGR2GRAY)
+        right = cv2.GaussianBlur(left, (5, 5), 0)
+        right_edge_img = None
+    else:
+        enhanced_right = writeback_structure(right_raw, structure)
+        right_edge_img = edge_enhance(enhanced_right)
+        left = cv2.cvtColor(edge_img, cv2.COLOR_BGR2GRAY)
+        right = cv2.cvtColor(right_edge_img, cv2.COLOR_BGR2GRAY)
+
+    # 视差
+    disp = compute_disparity(left, right)
+
+    # 深度
+    depth = depth_from_disp(disp)
+
+    # 拟合 Agent
+    depth_fit = fit_depth(depth)
+
+    # 保存
+    cv2.imwrite(os.path.join(args.out_dir, "fused_gray.png"), fused_gray)
+    cv2.imwrite(os.path.join(args.out_dir, "structure.png"), structure)
+    cv2.imwrite(os.path.join(args.out_dir, "enhanced.png"), enhanced)
+    cv2.imwrite(os.path.join(args.out_dir, "edge.png"), edge_img)
+    if right_edge_img is not None:
+        cv2.imwrite(os.path.join(args.out_dir, "right_edge.png"), right_edge_img)
+
+    disp_vis = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    depth_vis = cv2.normalize(depth_fit, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    cv2.imwrite(os.path.join(args.out_dir, "disparity.png"), disp_vis)
+    cv2.imwrite(os.path.join(args.out_dir, "depth.png"), depth_vis)
+
+    print("Pipeline done. Output in:", args.out_dir)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
