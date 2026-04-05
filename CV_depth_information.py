@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
+import zipfile
 
 
 def edge_enhance(img_rgb: np.ndarray) -> np.ndarray:
@@ -57,47 +58,127 @@ def normalize_to_u8(img: np.ndarray, lo: float = 2.0, hi: float = 98.0) -> np.nd
     return (out * 255.0).astype(np.uint8)
 
 
-def run_classifier(view_imgs_rgb: List[np.ndarray], num_classes: int) -> Optional[int]:
-    try:
-        import torch
-        import torch.nn as nn
-        import torchvision.models as models
-        import torchvision.transforms as T
-    except Exception as e:
-        print(f"Skip classifier (missing torch/torchvision): {e}")
-        return None
 
-    class MultiViewClassifier(nn.Module):
-        def __init__(self, num_views: int, num_classes: int):
-            super().__init__()
-            self.num_views = num_views
-            self.backbone = models.resnet18(weights=None)
-            self.backbone.fc = nn.Identity()
-            self.fc = nn.Linear(512, num_classes)
+def resize_keep_aspect_bgr(img_bgr: np.ndarray, target_w: int) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    if w == target_w:
+        return img_bgr
+    target_h = max(1, int(round(h * (target_w / float(w)))))
+    return cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
-        def forward(self, imgs: List[torch.Tensor]) -> torch.Tensor:
-            feats = [self.backbone(img) for img in imgs]
-            fused = torch.mean(torch.stack(feats), dim=0)
-            return self.fc(fused)
 
-    transform = T.Compose(
-        [
-            T.ToTensor(),
-            T.Resize((224, 224)),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    view_tensors = [transform(img).unsqueeze(0) for img in view_imgs_rgb]
+def make_overview_image(tiles: List[tuple[str, np.ndarray]], cols: int = 3, target_w: int = 640, pad: int = 12) -> np.ndarray:
+    resized: List[tuple[str, np.ndarray]] = []
+    max_h = 1
+    for title, img in tiles:
+        img_r = resize_keep_aspect_bgr(img, target_w=target_w)
+        max_h = max(max_h, img_r.shape[0])
+        resized.append((title, img_r))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiViewClassifier(num_views=len(view_tensors), num_classes=num_classes).to(device)
-    model.eval()
+    rows = (len(resized) + cols - 1) // cols
+    tile_h = max_h
+    tile_w = target_w
 
-    with torch.no_grad():
-        view_tensors = [t.to(device) for t in view_tensors]
-        logits = model(view_tensors)
-        pred = int(torch.argmax(logits, dim=1).item())
-    return pred
+    canvas_h = pad + rows * (tile_h + pad)
+    canvas_w = pad + cols * (tile_w + pad)
+    canvas = np.full((canvas_h, canvas_w, 3), 18, dtype=np.uint8)
+
+    for idx, (title, img) in enumerate(resized):
+        r = idx // cols
+        c = idx % cols
+        x0 = pad + c * (tile_w + pad)
+        y0 = pad + r * (tile_h + pad)
+        canvas[y0 : y0 + img.shape[0], x0 : x0 + img.shape[1]] = img
+        cv2.putText(canvas, title, (x0 + 10, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return canvas
+
+
+def decode_png_from_zip(zf: zipfile.ZipFile, member: str) -> np.ndarray:
+    data = zf.read(member)
+    buf = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to decode: {member}")
+    return img
+
+
+def list_kitti_stereo_pairs(zip_path: str) -> List[tuple[str, str, str]]:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+
+    left = {}
+    right = {}
+    for n in names:
+        if n.endswith("/") or not n.endswith(".png"):
+            continue
+        if "/image_02/data/" in n:
+            fid = os.path.splitext(os.path.basename(n))[0]
+            left[fid] = n
+        elif "/image_03/data/" in n:
+            fid = os.path.splitext(os.path.basename(n))[0]
+            right[fid] = n
+
+    common = sorted(set(left.keys()) & set(right.keys()))
+    return [(fid, left[fid], right[fid]) for fid in common]
+
+
+def process_stereo_pair(
+    left_bgr: np.ndarray,
+    right_bgr: np.ndarray,
+    out_dir: str,
+    num_disp: int,
+    block_size: int,
+    focal_length_px: float,
+    baseline_m: float,
+    write_overview: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if left_bgr is None or right_bgr is None:
+        raise ValueError("left/right image is None")
+    if left_bgr.shape[:2] != right_bgr.shape[:2]:
+        raise ValueError(f"left/right size mismatch: {left_bgr.shape} vs {right_bgr.shape}")
+
+    left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
+    right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
+
+    left_enh = edge_enhance(left_rgb)
+    right_enh = edge_enhance(right_rgb)
+
+    disp_map = compute_disparity_sgbm(left_enh, right_enh, num_disp=num_disp, block_size=block_size)
+    depth_map = depth_from_disparity(disp_map, focal_length_px=focal_length_px, baseline_m=baseline_m)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    left_enh_bgr = cv2.cvtColor(left_enh, cv2.COLOR_RGB2BGR)
+    right_enh_bgr = cv2.cvtColor(right_enh, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(os.path.join(out_dir, "left_enh.png"), left_enh_bgr)
+    cv2.imwrite(os.path.join(out_dir, "right_enh.png"), right_enh_bgr)
+
+    disp_u8 = normalize_to_u8(disp_map)
+    disp_color = cv2.applyColorMap(disp_u8, cv2.COLORMAP_INFERNO)
+    cv2.imwrite(os.path.join(out_dir, "disparity.png"), disp_color)
+
+    depth_u8 = normalize_to_u8(depth_map)
+    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_PLASMA)
+    cv2.imwrite(os.path.join(out_dir, "depth.png"), depth_color)
+
+    if write_overview:
+        overview = make_overview_image(
+            [
+                ("left", left_bgr),
+                ("right", right_bgr),
+                ("left_enh", left_enh_bgr),
+                ("right_enh", right_enh_bgr),
+                ("disparity", disp_color),
+                ("depth", depth_color),
+            ],
+            cols=3,
+            target_w=min(640, int(left_bgr.shape[1])),
+            pad=12,
+        )
+        cv2.imwrite(os.path.join(out_dir, "overview.png"), overview)
+
+    return disp_map, depth_map, disp_color, depth_color
 
 
 def main() -> int:
@@ -109,68 +190,103 @@ def main() -> int:
     parser.add_argument("--block_size", type=int, default=7)
     parser.add_argument("--focal_length_px", type=float, default=0.8)
     parser.add_argument("--baseline_m", type=float, default=0.1)
-    parser.add_argument("--run_classifier", action="store_true")
+    parser.add_argument("--kitti_zip", default=None)
+    parser.add_argument("--kitti_n", type=int, default=0)
+    parser.add_argument("--kitti_start", type=int, default=0)
+    parser.add_argument("--kitti_stride", type=int, default=10)
     parser.add_argument("--num_classes", type=int, default=5)
     args = parser.parse_args()
 
-    left_bgr = cv2.imread(args.left, cv2.IMREAD_COLOR)
-    right_bgr = cv2.imread(args.right, cv2.IMREAD_COLOR)
-    if left_bgr is None:
-        raise FileNotFoundError(f"Failed to read left image: {args.left}")
-    if right_bgr is None:
-        raise FileNotFoundError(f"Failed to read right image: {args.right}")
-    if left_bgr.shape[:2] != right_bgr.shape[:2]:
-        raise ValueError(f"left/right size mismatch: {left_bgr.shape} vs {right_bgr.shape}")
+    if args.kitti_zip is None:
+        left_bgr = cv2.imread(args.left, cv2.IMREAD_COLOR)
+        right_bgr = cv2.imread(args.right, cv2.IMREAD_COLOR)
+        if left_bgr is None:
+            raise FileNotFoundError(f"Failed to read left image: {args.left}")
+        if right_bgr is None:
+            raise FileNotFoundError(f"Failed to read right image: {args.right}")
 
-    left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
-    right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
+        disp_map, depth_map, _, _ = process_stereo_pair(
+            left_bgr=left_bgr,
+            right_bgr=right_bgr,
+            out_dir=args.out_dir,
+            num_disp=args.num_disp,
+            block_size=args.block_size,
+            focal_length_px=args.focal_length_px,
+            baseline_m=args.baseline_m,
+            write_overview=True,
+        )
 
-    left_enh = edge_enhance(left_rgb)
-    right_enh = edge_enhance(right_rgb)
+        disp_finite = np.isfinite(disp_map)
+        depth_finite = np.isfinite(depth_map)
+        print(
+            "disparity:",
+            "min",
+            float(np.min(disp_map[disp_finite])) if disp_finite.any() else None,
+            "max",
+            float(np.max(disp_map[disp_finite])) if disp_finite.any() else None,
+            "mean",
+            float(np.mean(disp_map[disp_finite])) if disp_finite.any() else None,
+        )
+        print(
+            "depth:",
+            "min",
+            float(np.min(depth_map[depth_finite])) if depth_finite.any() else None,
+            "max",
+            float(np.max(depth_map[depth_finite])) if depth_finite.any() else None,
+            "mean",
+            float(np.mean(depth_map[depth_finite])) if depth_finite.any() else None,
+        )
+        print("saved:", os.path.abspath(args.out_dir))
 
-    disp_map = compute_disparity_sgbm(left_enh, right_enh, num_disp=args.num_disp, block_size=args.block_size)
-    depth_map = depth_from_disparity(disp_map, focal_length_px=args.focal_length_px, baseline_m=args.baseline_m)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+        return 0
 
-    cv2.imwrite(os.path.join(args.out_dir, "left_enh.png"), cv2.cvtColor(left_enh, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(os.path.join(args.out_dir, "right_enh.png"), cv2.cvtColor(right_enh, cv2.COLOR_RGB2BGR))
+    pairs = list_kitti_stereo_pairs(args.kitti_zip)
+    if not pairs:
+        raise ValueError(f"No KITTI stereo pairs found in: {args.kitti_zip}")
 
-    disp_u8 = normalize_to_u8(disp_map)
-    disp_color = cv2.applyColorMap(disp_u8, cv2.COLORMAP_INFERNO)
-    cv2.imwrite(os.path.join(args.out_dir, "disparity.png"), disp_color)
+    if args.kitti_n <= 0:
+        kitti_n = min(12, max(1, (len(pairs) - args.kitti_start + args.kitti_stride - 1) // args.kitti_stride))
+    else:
+        kitti_n = args.kitti_n
 
-    depth_u8 = normalize_to_u8(depth_map)
-    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_PLASMA)
-    cv2.imwrite(os.path.join(args.out_dir, "depth.png"), depth_color)
+    if args.focal_length_px == 0.8 and args.baseline_m == 0.1:
+        focal_length_px = 721.5377
+        baseline_m = 0.5327254279298227
+    else:
+        focal_length_px = args.focal_length_px
+        baseline_m = args.baseline_m
 
-    disp_finite = np.isfinite(disp_map)
-    depth_finite = np.isfinite(depth_map)
-    print(
-        "disparity:",
-        "min",
-        float(np.min(disp_map[disp_finite])) if disp_finite.any() else None,
-        "max",
-        float(np.max(disp_map[disp_finite])) if disp_finite.any() else None,
-        "mean",
-        float(np.mean(disp_map[disp_finite])) if disp_finite.any() else None,
-    )
-    print(
-        "depth:",
-        "min",
-        float(np.min(depth_map[depth_finite])) if depth_finite.any() else None,
-        "max",
-        float(np.max(depth_map[depth_finite])) if depth_finite.any() else None,
-        "mean",
-        float(np.mean(depth_map[depth_finite])) if depth_finite.any() else None,
-    )
-    print("saved:", os.path.abspath(args.out_dir))
+    selected = []
+    idx = args.kitti_start
+    while idx < len(pairs) and len(selected) < kitti_n:
+        selected.append(pairs[idx])
+        idx += max(1, args.kitti_stride)
 
-    if args.run_classifier:
-        pred = run_classifier([left_rgb, right_rgb], num_classes=args.num_classes)
-        if pred is not None:
-            print("Predicted object class:", pred)
+    out_root = args.out_dir
+    os.makedirs(out_root, exist_ok=True)
 
+    depth_tiles: List[tuple[str, np.ndarray]] = []
+    with zipfile.ZipFile(args.kitti_zip, "r") as zf:
+        for fid, left_member, right_member in selected:
+            left_bgr = decode_png_from_zip(zf, left_member)
+            right_bgr = decode_png_from_zip(zf, right_member)
+            frame_out = os.path.join(out_root, f"kitti_{fid}")
+            _, _, _, depth_color = process_stereo_pair(
+                left_bgr=left_bgr,
+                right_bgr=right_bgr,
+                out_dir=frame_out,
+                num_disp=args.num_disp,
+                block_size=args.block_size,
+                focal_length_px=focal_length_px,
+                baseline_m=baseline_m,
+                write_overview=True,
+            )
+            depth_tiles.append((fid, depth_color))
+
+    summary = make_overview_image(depth_tiles, cols=4, target_w=480, pad=12)
+    cv2.imwrite(os.path.join(out_root, "kitti_depth_summary.png"), summary)
+    print("saved:", os.path.abspath(out_root))
     return 0
 
 
