@@ -1,3 +1,5 @@
+## 田大庆提供的代码，从单张伪噪声
+# 
 import cv2
 import numpy as np
 import os
@@ -14,29 +16,26 @@ class StereoscopicGenerator:
 
     def _image_fitting(self, left_img, right_img):
         """智能体图像拟合模块（防晕核心）"""
-        # 1. 颜色匹配
-        matched_right = cv2.xphoto.createSimpleWB().balanceWhite(right_img)
+        matched_right = right_img
+        if hasattr(cv2, "xphoto") and hasattr(cv2.xphoto, "createSimpleWB"):
+            matched_right = cv2.xphoto.createSimpleWB().balanceWhite(right_img)
         
-        # 2. 边缘平滑与空洞修复
         gray_left = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
         gray_right = cv2.cvtColor(matched_right, cv2.COLOR_BGR2GRAY)
         
-        # 计算视差图用于引导滤波
         stereo = cv2.StereoSGBM_create(minDisparity=-16, numDisparities=32, blockSize=5)
         disp = stereo.compute(gray_left, gray_right).astype(np.float32) / 16.0
         
-        # 引导滤波，平滑视差，保持边缘
         if disp.max() > disp.min():
             disp_norm = (disp - disp.min()) / (disp.max() - disp.min())
-            disp_smooth = cv2.ximgproc.guidedFilter(left_img, disp_norm, 10, 0.01)
-            # 重新映射右眼图
+            if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+                disp_smooth = cv2.ximgproc.guidedFilter(left_img, disp_norm, 10, 0.01)
+            else:
+                disp_smooth = cv2.GaussianBlur(disp_norm, (0, 0), 1.5)
             h, w = left_img.shape[:2]
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] = x + (disp_smooth[y, x] - 0.5) * self.config['disparity']
-                    map_y[y, x] = y
+            xs = np.arange(w, dtype=np.float32)[None, :]
+            map_x = xs + (disp_smooth.astype(np.float32) - 0.5) * float(self.config["disparity"])
+            map_y = np.repeat(np.arange(h, dtype=np.float32)[:, None], w, axis=1)
             fitted_right = cv2.remap(matched_right, map_x, map_y, cv2.INTER_LINEAR)
         else:
             fitted_right = matched_right
@@ -53,8 +52,9 @@ class StereoscopicGenerator:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         fused = np.zeros_like(gray, dtype=np.float32)
         for _ in range(self.config['N']):
-            g = gray.copy()
-            g += np.random.normal(0, self.config['noise'], g.shape)
+            g = gray.astype(np.float32)
+            g += np.random.normal(0, self.config['noise'], g.shape).astype(np.float32)
+            g = np.clip(g, 0.0, 255.0)
             dx = np.random.randint(-self.config['shift'], self.config['shift'] + 1)
             dy = np.random.randint(-self.config['shift'], self.config['shift'] + 1)
             M = np.float32([[1, 0, dx], [0, 1, dy]])
@@ -97,7 +97,7 @@ if __name__ == '__main__':
     OUTPUT_DIR = r'image_datasets/outputs_standard'    # 改成你的输出文件夹
     
     # 选择模式: 'soft', 'standard', 'strong'
-    generator = StereoscopicGenerator(mode='standard')
+    generator = StereoscopicGenerator(mode='strong')
     
     # 开始批量生成
     generator.batch_run(INPUT_DIR, OUTPUT_DIR)
