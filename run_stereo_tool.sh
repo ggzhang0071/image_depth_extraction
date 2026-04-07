@@ -1,0 +1,1 @@
+python stereo_tool.py --input_dir image_datasets/flowers --output_dir Output_flowers --no_prompt && ls -lah Output_flowers | head -n 20
