@@ -76,7 +76,7 @@ class StereoscopicGenerator:
         fused = np.zeros_like(gray, dtype=np.float32)
         for _ in range(self.config['N']):
             g = gray.astype(np.float32)
-            g += np.random.normal(0, self.config['noise'], g.shape).astype(np.float32)
+            g += np.random.normal(0, self.config["noise"], g.shape).astype(np.float32)
             g = np.clip(g, 0.0, 255.0)
             dx = np.random.randint(-self.config['shift'], self.config['shift'] + 1)
             dy = np.random.randint(-self.config['shift'], self.config['shift'] + 1)
@@ -128,9 +128,12 @@ class StereoscopicGenerator:
 
 # ===== 主程序入口 =====
 if __name__ == '__main__':
-    INPUT_DIR = r'image_datasets/timmer'   # 改成你的输入文件夹
+    INPUT_DIR = r'image_datasets/flowers'   # 改成你的输入文件夹
     OUTPUT_DIR = r'image_datasets/outputs_standard'    # 改成你的输出文件夹
+    
     
     generator = StereoscopicGenerator(mode='standard')
     generator.batch_run(INPUT_DIR, OUTPUT_DIR)
+
     print("✅ 批量生成完成！包含左右眼图和红蓝测试图。")
+
